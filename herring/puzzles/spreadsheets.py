@@ -4,6 +4,7 @@ from django.conf import settings
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from lazy_object_proxy import Proxy as lazy_object
+from puzzles.discordbot import log_to_discord
 
 
 @lazy_object
@@ -12,7 +13,7 @@ def service():
         logging.warning("Running without GApps integration!")
         return None
     try:
-        logging.info("settings: %s", settings.HERRING_FUCK_OAUTH)
+        #logging.info("settings: %s", settings.HERRING_FUCK_OAUTH)
         credentials = Credentials.from_service_account_info(
             settings.HERRING_FUCK_OAUTH,
             scopes=['https://www.googleapis.com/auth/drive'])
@@ -26,9 +27,12 @@ def make_sheet(title):
     body = {
         'mimeType': 'application/vnd.google-apps.spreadsheet',
         'name': title,
-        'parents': [settings.HERRING_SECRETS['gapps-folder']]
+        'parents': [settings.HERRING_SECRETS['gapps-folder']],
+        'contentRestrictions': {
+            'readOnly': False,  # Not sure if this is necessary or sufficient
+        },
     }
-    got = service.files().create(body=body).execute()
+    got = service.files().copy(fileId=settings.HERRING_SECRETS['gapps-doc-to-clone'], body=body).execute()
     return got['id']
 
 

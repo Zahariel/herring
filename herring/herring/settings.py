@@ -139,8 +139,12 @@ CELERY_BEAT_SCHEDULE = {
 # forcefully killed, in which case having a max_loop_interval of 30 seconds
 # means that it could be up to 6 minutes before another RedBeat claims the
 # lock and starts scheduling tasks again.
-CELERY_BEAT_MAX_LOOP_INTERVAL = 30
+# [gwillen 2021]: shorten this to make restarts less terrible.
+CELERY_BEAT_MAX_LOOP_INTERVAL = 10
 
+# For some reason instead of 5x the loop interval, this defaults to 5x the
+#   DEFAULT loop interval, which is 25 minutes, which is unacceptably long.
+REDBEAT_LOCK_TIMEOUT = 60
 
 # Previously in puzzles/tasks.py
 HERRING_STATUS_CHANNEL = env.get_value('STATUS_CHANNEL', default='_dev_puzzle_status')
@@ -148,11 +152,10 @@ HERRING_HOST = env.get_value('HOST', default='http://localhost:8000')
 HERRING_PUZZLE_ACTIVITY_LOG_URL = env.get_value('PUZZLE_ACTIVITY_LOG_URL', default=None)
 HERRING_PUZZLE_SITE_SESSION_COOKIE = env.get_value('PUZZLE_SITE_SESSION_COOKIE', default=None)
 
-HERRING_DISCORD_GUILD_ID = int(env.get_value('DISCORD_GUILD', default=750176135224229979))
-HERRING_DISCORD_PROTECTED_CATEGORIES = set(json.loads(env.get_value('DISCORD_PROTECTED_CATEGORIES', default="[750176135849050192, 779933113450102834]")))
+HERRING_DISCORD_GUILD_ID = int(env.get_value('DISCORD_GUILD', default=0))
+HERRING_DISCORD_PROTECTED_CATEGORIES = set(json.loads(env.get_value('DISCORD_PROTECTED_CATEGORIES', default='[]')))
 HERRING_DISCORD_PUZZLE_ANNOUNCEMENTS = env.get_value('DISCORD_ANNOUNCEMENTS', default='puzzle-announcements')
-HERRING_DISCORD_PRONOUN_ROLES = json.loads(env.get_value('DISCORD_PRONOUN_ROLES', default="[795881206091612201, 795881120683261972, 795881227356995634]"))
-HERRING_DISCORD_TIMEZONE_ROLES = json.loads(env.get_value('DISCORD_TIMEZONE_ROLES', default="[795881265382555688, 795881313113735209, 795881371704885279, 795881402138624080]"))
+HERRING_DISCORD_DEBUG_CHANNEL = env.get_value('DISCORD_DEBUG_CHANNEL', default='herringbot-debug')
 HERRING_DISCORD_BITRATE = env.int('DISCORD_BITRATE', default=128000)
 
 # Previously in herring/secrets.py
@@ -167,7 +170,15 @@ HERRING_ACTIVATE_GAPPS = env.bool('ACTIVATE_GAPPS', default=False)
 HERRING_ACTIVATE_SLACK = env.bool('ACTIVATE_SLACK', default=False)
 HERRING_ACTIVATE_DISCORD = env.bool('ACTIVATE_DISCORD', default=False)
 
+HERRING_ERRORS_TO_DISCORD = env.bool('ERRORS_TO_DISCORD', default=False)
+
 HERRING_SOLVERTOOLS_URL = env.get_value('SOLVERTOOLS_URL', default="http://ireproof.org/")
+
+# https://devcenter.heroku.com/articles/dyno-metadata
+HEROKU_APP_NAME = env.get_value('HEROKU_APP_NAME', default='<unknown>')
+HEROKU_RELEASE_VERSION = env.get_value('HEROKU_RELEASE_VERSION', default='<unknown>')
+# https://devcenter.heroku.com/articles/dynos#local-environment-variables
+HEROKU_DYNO_NAME = env.get_value('DYNO', default='<unknown>')
 
 LOGGING = {
     'version': 1,
@@ -175,6 +186,12 @@ LOGGING = {
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
+            'formatter': 'default',
+        },
+        'chat': {
+            'class': 'herring.log_custom.ChatLogHandler',
+            'level': 'WARNING',
+            'formatter': 'default',
         },
     },
     'root': {
@@ -190,4 +207,16 @@ LOGGING = {
             'propagate': False,
         },
     },
+    'formatters': {
+        'default': {
+            # See https://hg.python.org/cpython/file/5c4ca109af1c/Lib/logging/__init__.py#l399
+            'format': "[%(asctime)s %(levelname)-8s %(name)-15s] %(message)s",
+            'dateformat': '%Y-%m-%d %H:%M:%S',
+        },
+    },
 }
+
+# Only turn this on if explicitly enabled, since it's kind of hazardous.
+if HERRING_ACTIVATE_DISCORD and HERRING_ERRORS_TO_DISCORD:
+    LOGGING['root']['handlers'].append('chat')
+    LOGGING['loggers']['django.db.backends']['handlers'].append('chat')

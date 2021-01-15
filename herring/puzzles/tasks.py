@@ -1,6 +1,7 @@
 from typing import Optional
 
 from asgiref.sync import sync_to_async
+import asyncio
 from asyncio import run, sleep, wait, get_event_loop
 from cachetools.func import ttl_cache
 from celery import shared_task
@@ -10,7 +11,7 @@ from django.db import transaction
 import json
 import kombu.exceptions
 from lazy_object_proxy import Proxy as lazy_object
-from puzzles.discordbot import HerringAnnouncerBot, make_announcer_bot, run_listener_bot
+from puzzles.discordbot import run_listener_bot, DISCORD_ANNOUNCER, do_in_discord
 from puzzles.models import Puzzle, Round, UserProfile
 from puzzles.spreadsheets import check_spreadsheet_service, iterate_changes, make_sheet
 from redis import Redis
@@ -53,25 +54,7 @@ def REDIS():
     # Redis connections so quickly; it's possible this doesn't help at all.
     return Redis.from_url(settings.REDIS_URL, max_connections=1)
 
-@lazy_object
-def DISCORD_ANNOUNCER() -> Optional[HerringAnnouncerBot]:
-    if not settings.HERRING_ACTIVATE_DISCORD:
-        logging.warning("Running without Discord integration!")
-        return None
-    return make_announcer_bot(settings.HERRING_SECRETS['discord-bot-token'])
-
 _optional_tasks_enabled = None
-
-
-def do_in_discord(coro):
-    try:
-        return DISCORD_ANNOUNCER.do_in_loop(coro)
-    except RuntimeError:
-        # probably the discord bot is busted, try to make it rebuild
-        logging.error("Invalidating discord announcer bot!")
-        del DISCORD_ANNOUNCER.__target__
-        raise
-
 
 def optional_task(t):
     """
@@ -291,6 +274,7 @@ def check_connection_to_messaging():
     mutex = REDIS.lock('puzzles.tasks.check_connection_to_messaging:mutex', timeout=10)
 
     if not mutex.acquire(blocking=False):
+        logging.info("check_connection_to_messaging: Didn't get mutex, messaging already active")
         return
 
     logging.info("check_connection_to_messaging: Acquired mutex")
@@ -300,12 +284,19 @@ def check_connection_to_messaging():
             await sleep(2)
             mutex.reacquire()
 
+    async def _check_connection_to_messaging():
+        awaitables = [
+            asyncio.create_task(process_slack_messages_forever(), name="process_slack_messages_forever"),
+            asyncio.create_task(run_discord_listener_bot(), name="run_discord_listener_bot"),
+            asyncio.create_task(keep_mutex(), name="keep_mutex")
+        ]
+        return await asyncio.gather(*awaitables)
+
     try:
-        run(wait([process_slack_messages_forever(), run_discord_listener_bot(), keep_mutex()]))
+        run(_check_connection_to_messaging())
     finally:
         mutex.release()
         logging.info("check_connection_to_messaging: Released mutex")
-
 
 async def run_discord_listener_bot():
     if settings.HERRING_ACTIVATE_DISCORD:

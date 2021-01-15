@@ -8,6 +8,11 @@ import typing
 from datetime import timezone
 from urllib.parse import urljoin
 import aiohttp
+from lazy_object_proxy import Proxy as lazy_object
+import traceback
+import sys
+
+from typing import Optional
 
 import discord
 from asgiref.sync import async_to_sync, sync_to_async
@@ -55,6 +60,12 @@ SIGNUP_EMOJI = "\N{RAISED HAND}"
 # this is the most users we'll try to mention during an hb!who; more than this and you just get the number
 MAX_USER_LIST = 10
 
+# for safety's sake, we will only allow auto-assignment of roles below this role, to prevent bugs allowing
+# auto-assignment of powerful roles.
+AUTOROLE_MARKER = "-autoroles below-"
+
+MAX_DISCORD_EMBED_LEN = 2048
+
 class HerringCog(commands.Cog):
     def __init__(self, bot:commands.Bot):
         self.bot = bot
@@ -63,12 +74,42 @@ class HerringCog(commands.Cog):
         self.pronoun_roles = []
         self.timezone_roles = []
 
+    def get_pronoun_roles(self):
+        result = []
+
+        found_autoroles = False
+        for role in reversed(self.guild.roles):
+            if not found_autoroles and (role.name != AUTOROLE_MARKER):
+                continue
+            found_autoroles = True
+
+            # You know what, it's close enough.
+            if "/" in role.name:
+                result.append(role)
+        logging.info(f"Auto-detected pronoun roles: {result} (found autorole marker: {found_autoroles})")
+        return result
+
+    def get_timezone_roles(self):
+        result = []
+
+        found_autoroles = False
+        for role in reversed(self.guild.roles):
+            if not found_autoroles and role.name != AUTOROLE_MARKER:
+                continue
+            found_autoroles = True
+
+            if "UTC" in role.name:
+                result.append(role)
+        logging.info(f"Auto-detected timezone roles: {result} (found autorole marker: {found_autoroles})")
+        return result
+
     @commands.Cog.listener()
     async def on_ready(self):
         self.guild = self.bot.get_guild(settings.HERRING_DISCORD_GUILD_ID)
         self.announce_channel = get(self.guild.text_channels, name = settings.HERRING_DISCORD_PUZZLE_ANNOUNCEMENTS)
-        self.pronoun_roles = [self.guild.get_role(role_id) for role_id in settings.HERRING_DISCORD_PRONOUN_ROLES]
-        self.timezone_roles = [self.guild.get_role(role_id) for role_id in settings.HERRING_DISCORD_TIMEZONE_ROLES]
+        self.debug_channel = get(self.guild.text_channels, name = settings.HERRING_DISCORD_DEBUG_CHANNEL)
+        self.pronoun_roles = self.get_pronoun_roles()
+        self.timezone_roles = self.get_timezone_roles()
 
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
@@ -118,7 +159,14 @@ class HerringCog(commands.Cog):
                 row.is_member = True
                 row.save(update_fields=['user_id', 'last_active', 'is_member', 'display_name'])
 
-        puzzle = await _manipulate_puzzle(message.channel.name, record_activity)
+        try:
+            puzzle = await _get_puzzle_by_slug(message.channel.name)
+        except Puzzle.DoesNotExist as e:
+            # This is fine -- we must have seen a non-command message in a non-puzzle channel. Ignore it.
+            # Optionally, we could verify that it's in a non-puzzle category.
+            return
+
+        await _manipulate_puzzle(message.channel.name, record_activity)
 
         if puzzle is not None:
             need_mentions = []
@@ -170,12 +218,16 @@ class HerringCog(commands.Cog):
             return
 
         def puzzle_printerizer(puzzle):
-            text_channel, voice_channel = self.get_channel_pair(puzzle.slug)
-            # -2 for @everyone and the bot
-            people_watching = len(text_channel.overwrites) - 2
-            people_chatting = len(voice_channel.voice_states)
             solved = "(SOLVED!) " if puzzle.answer else ""
-            return f"{_abbreviate_name(puzzle)} {solved}{people_watching} watchers, {people_chatting} in voice)"
+            try:
+                text_channel, voice_channel = self.get_channel_pair(puzzle.slug)
+                # -2 for @everyone and the bot
+                people_watching = len(text_channel.overwrites) - 2
+                people_chatting = len(voice_channel.voice_states)
+                return f"{_abbreviate_name(puzzle)} {solved}({people_watching} watchers, {people_chatting} in voice)"
+            except Exception as e:
+                log_to_discord(f"Failed to printerize puzzle: {puzzle}", exn=e)
+                return f"{_abbreviate_name(puzzle)} {solved}<problem with puzzle channels, admins have been notified>"
 
         puzzle_chosen: Puzzle = await self.do_menu(
             ctx.author,
@@ -190,7 +242,7 @@ class HerringCog(commands.Cog):
 
         logging.info(f"adding {member} to {puzzle_chosen.slug}")
         channel, _ = await self.add_user_to_puzzle(member, puzzle_chosen.slug)
-        await ctx.author.send(f"Welcome to the puzzle {puzzle_chosen.name} in {channel.mention}! Happy solving!")
+        await ctx.author.send(f"Welcome to the puzzle `{puzzle_chosen.name}`! Click to go there: {channel.mention}! Happy solving!")
 
     @commands.command(aliases=["part"], brief="Leave a puzzle channel")
     async def leave(self, ctx, channel:typing.Optional[discord.TextChannel]):
@@ -394,7 +446,7 @@ class HerringCog(commands.Cog):
         await self.delete_message_if_possible(ctx.message)
 
         if ctx.author.id != self.guild.owner_id:
-            return
+            raise commands.NotOwner()
 
         run_modes = {
             "Full Rebuild": (True, True, True),
@@ -411,7 +463,7 @@ class HerringCog(commands.Cog):
         )
         if run_mode is None:
             # timed out, bail
-            return
+            raise commands.UserInputError("Command timed out!")
 
         fix, create, delete = run_modes[run_mode]
 
@@ -445,16 +497,14 @@ class HerringCog(commands.Cog):
                 continue
             for channel in category.channels:
                 if channel.name not in puzzles_by_slug:
+                    await ctx.author.send(f"Deleting {channel.type} channel {channel.name} in {category.name} (for real: {delete})")
                     if delete:
                         await channel.delete()
-                    else:
-                        await ctx.author.send(f"Deleting {channel.type} channel {channel.name} in {category.name}")
 
             if category.id not in rounds_by_category:
+                await ctx.author.send(f"Deleting category {category.name} (for real: {delete})")
                 if delete:
                     await category.delete()
-                else:
-                    await ctx.author.send(f"Deleting category {category.name}")
 
         for round in rounds:
             # next, create any categories that don't seem to exist for whatever reason
@@ -462,18 +512,17 @@ class HerringCog(commands.Cog):
             for idx, category_id in enumerate(split_categories(round)):
                 category = self.guild.get_channel(category_id)
                 if category is None:
+                    await ctx.author.send(f"creating new category for {round.name} {idx} (for real: {create})")
                     if create:
                         category = await _make_category_inner(self.guild, f"{round.name} {idx}" if idx > 0 else round.name)
-                    else:
-                        await ctx.author.send(f"creating new category for {round.name} {idx}")
                 new_categories.append(category)
 
             # pretend rounds with no puzzles have one puzzle, just in case
             while max(1, len(puzzles_by_round[round.id])) > len(new_categories) * PUZZLES_PER_CATEGORY:
+                await ctx.author.send(f"creating new category for {round.name} {len(new_categories)} (for real: {create})")
                 if create:
                     category = await _make_category_inner(self.guild, f"{round.name} {len(new_categories)}" if len(new_categories) > 0 else round.name)
                 else:
-                    await ctx.author.send(f"creating new category for {round.name} {len(new_categories)}")
                     category = None
                 new_categories.append(category)
 
@@ -484,35 +533,30 @@ class HerringCog(commands.Cog):
 
             new_categories_value = ",".join(str(category.id) for category in new_categories)
             if new_categories_value != round.discord_categories:
+                await ctx.author.send(f"saving {new_categories_value} to round {round.name} (for real: {create})")
                 if create:
                     await save_categories(round, new_categories_value)
-                else:
-                    await ctx.author.send(f"saving {new_categories_value} to round {round.name}")
 
             async def fixup_puzzle(puzzle, category_idx):
                 text_channel, voice_channel = self.get_channel_pair(puzzle.slug)
                 if text_channel is None or voice_channel is None:
+                    await ctx.author.send(f"creating channels for {puzzle.name} in {round.name} {category_idx} (for real: {create})")
                     if create:
                         text_channel, voice_channel = await _make_puzzle_channels_inner(new_categories[category_idx], puzzle)
-                    else:
-                        await ctx.author.send(f"creating channels for {puzzle.name} in {round.name} {category_idx}")
                 if text_channel is not None and text_channel.category != new_categories[category_idx]:
+                    await ctx.author.send(f"Moving {puzzle.name} (text) to category {round.name} {category_idx} (for real: {fix})")
                     if fix:
                         await text_channel.edit(category=new_categories[category_idx])
-                    else:
-                        await ctx.author.send(f"Moving {puzzle.name} (text) to category {round.name} {category_idx}")
                 if voice_channel is not None and voice_channel.category != new_categories[category_idx]:
+                    await ctx.author.send(f"Moving {puzzle.name} (voice) to category {round.name} {category_idx} (for real: {fix})")
                     if fix:
                         await voice_channel.edit(category=new_categories[category_idx])
-                    else:
-                        await ctx.author.send(f"Moving {puzzle.name} (voice) to category {round.name} {category_idx}")
 
                 new_topic = _build_topic(puzzle)
                 if text_channel is not None and text_channel.topic != new_topic:
+                    await ctx.author.send(f"Fixing topic of {puzzle.name} (for real: {fix})")
                     if fix:
                         await text_channel.edit(topic=new_topic)
-                    else:
-                        await ctx.author.send(f"Fixing topic of {puzzle.name}")
                 if fix and text_channel is not None:
                     await _manipulate_puzzle(puzzle, self._update_channel_participation)
 
@@ -531,11 +575,13 @@ class HerringCog(commands.Cog):
             for idx, puzzle in enumerate(puzzles_by_round[round.id]):
                 if puzzle.is_meta:
                     continue
-                await fixup_puzzle(puzzle, new_categories[idx // PUZZLES_PER_CATEGORY])
+                await fixup_puzzle(puzzle, idx // PUZZLES_PER_CATEGORY)
 
             # finally, put the metapuzzles back
             for puzzle in metapuzzles_by_round[round.id]:
                 await fixup_puzzle(puzzle, 0)
+
+        await ctx.author.send("cleanup_channels: Done.")
 
     @staticmethod
     async def delete_message_if_possible(request_message):
@@ -550,6 +596,7 @@ class HerringCog(commands.Cog):
 
         if changed:
             await _manipulate_puzzle(puzzle_name, self._update_channel_participation)
+            await text_channel.send(f"{member.mention} joined the puzzle.")
         return text_channel, changed
 
     def get_channel_pair(self, puzzle_name):
@@ -566,6 +613,7 @@ class HerringCog(commands.Cog):
 
     async def do_menu(self, target, options, prompt, printerizer=(lambda x: x)):
         start = 0
+        options = list(options)  # cover for callers who pass something listlike that can't be subscripted
         while start < len(options):
             description = prompt + "\n"
             description += "\n".join(f"{reaction} : {printerizer(option)}" for reaction, option in zip(MENU_REACTIONS, options[start:]))
@@ -654,6 +702,60 @@ class SolvertoolsCog(commands.Cog):
             except aiohttp.ClientError:
                 await ctx.send("Sorry, the connection to ireproof.org doesn't seem to be working today.")
 
+# Copied from https://gist.github.com/EvieePy/7822af90858ef65012ea500bcecf1612
+class CommandErrorHandler(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_command_error(self, ctx, error):
+        """The event triggered when an error is raised while invoking a command.
+        Parameters
+        ------------
+        ctx: commands.Context
+            The context used for command invocation.
+        error: commands.CommandError
+            The Exception raised.
+        """
+
+        # This prevents any commands with local handlers being handled here in on_command_error.
+        if hasattr(ctx.command, 'on_error'):
+            return
+
+        # This prevents any cogs with an overwritten cog_command_error being handled here.
+        cog = ctx.cog
+        if cog:
+            if cog._get_overridden_method(cog.cog_command_error) is not None:
+                return
+
+        ignored = (commands.CommandNotFound, )
+
+        # Allows us to check for original exceptions raised and sent to CommandInvokeError.
+        # If nothing is found. We keep the exception passed to on_command_error.
+        error = getattr(error, 'original', error)
+
+        # Anything in ignored will return and prevent anything happening.
+        if isinstance(error, ignored):
+            return
+
+        if isinstance(error, commands.DisabledCommand):
+            await ctx.author.send(f'{ctx.command} has been disabled.')
+        elif isinstance(error, commands.NoPrivateMessage):
+            try:
+                await ctx.author.send(f'{ctx.command} can not be used in Private Messages.')
+            except discord.HTTPException:
+                pass
+        elif isinstance(error, commands.NotOwner):
+            await ctx.author.send(f'{ctx.command} can only be used by the bot owner.')
+        elif isinstance(error, commands.UserInputError):
+            await ctx.author.send(f'{ctx.command} failed: {error}')
+        else:
+            await ctx.author.send(f'{ctx.command} failed for some reason. The admins have been notified, probably.')
+            # All other Errors not returned come here. And we can just print the default TraceBack.
+            traceback.print_exception(type(error), error, error.__traceback__, file=sys.stderr)
+            if settings.HERRING_ERRORS_TO_DISCORD:
+                log_to_discord("on_command_error", exn=error)
+
 
 def command_prefix(bot, message:discord.Message):
     if message.channel.type == discord.ChannelType.private:
@@ -675,7 +777,11 @@ class HerringListenerBot(commands.Bot):
         super().__init__(command_prefix, *args, loop=loop, intents=intents, **kwargs)
         self.add_cog(HerringCog(self))
         self.add_cog(SolvertoolsCog(self, client))
+        self.add_cog(CommandErrorHandler(self))
 
+        @self.event
+        async def on_error(event, *args, **kwargs):
+            logging.error(f"Error in event: {event}, with args {args} and kwargs {kwargs}.", exc_info=True)
 
 class HerringAnnouncerBot(discord.Client):
     """
@@ -705,6 +811,16 @@ class HerringAnnouncerBot(discord.Client):
         except concurrent.futures.TimeoutError:
             logging.error(f"Timed out running {coro} in bot from thread {threading.current_thread()}", exc_info=True)
             raise RuntimeError("seems like the announcer bot is dead")
+
+    def do_in_loop_nonblocking(self, coro):
+        def handle_future_result(f):
+            # Retrieve and ignore result.
+            # I don't think this actually does anything?
+            # The goal was to suppress the warning that we ignored the result.
+            future.result()
+
+        future = asyncio.run_coroutine_threadsafe(coro, self.loop)
+        future.add_done_callback(handle_future_result)
 
     async def wait_until_really_ready(self, timeout=None):
         try:
@@ -749,8 +865,16 @@ class HerringAnnouncerBot(discord.Client):
         round, category = await ensure_category_ready()
 
         text_channel, voice_channel = await _make_puzzle_channels_inner(category, puzzle)
-        announcement = await self.announce_channel.send(f"New puzzle {puzzle.name} opened! {SIGNUP_EMOJI} this message to join, then head to {text_channel.mention}.")
+        announcement = await self.announce_channel.send(f"New puzzle {puzzle.name} opened! {SIGNUP_EMOJI} this message to join, then click here to jump to the channel: {text_channel.mention}.")
         await announcement.add_reaction(SIGNUP_EMOJI)
+
+    async def post_message(self, channel_name, message, **kwargs):
+        await self._really_ready.wait()
+        channel: discord.TextChannel = get(self.guild.text_channels, name=channel_name)
+        if channel is None:
+            logging.error(f"Couldn't get Discord channel {puzzle_name} in post_local_and_global!")
+            return
+        await channel.send(message, **kwargs)
 
     async def post_local_and_global(self, puzzle_name, local_message, global_message:str):
         await self._really_ready.wait()
@@ -772,9 +896,11 @@ class HerringAnnouncerBot(discord.Client):
         if member is None:
             logging.warning(f"couldn't find member named {user_profile.discord_identifier}")
             return
-        await _add_user_to_channels(member, text_channel, voice_channel)
+        changed = await _add_user_to_channels(member, text_channel, voice_channel)
         membership = [member for member in text_channel.overwrites if member.id != self.guild.me.id and member.id != self.guild.default_role.id]
         await _manipulate_puzzle(puzzle_name, lambda puzzle: _update_channel_participation_inner(puzzle, membership))
+        if changed:
+            await text_channel.send(f"{member.mention} joined the puzzle.")
         return text_channel
 
     def get_channel_pair(self, puzzle_name):
@@ -782,6 +908,48 @@ class HerringAnnouncerBot(discord.Client):
         voice_channel: discord.VoiceChannel = get(self.guild.voice_channels, name=puzzle_name)
         return text_channel, voice_channel
 
+@lazy_object
+def DISCORD_ANNOUNCER() -> Optional[HerringAnnouncerBot]:
+    if not settings.HERRING_ACTIVATE_DISCORD:
+        logging.warning("Running without Discord integration!")
+        return None
+    bot = make_announcer_bot(settings.HERRING_SECRETS['discord-bot-token'])
+    if bot:
+        # Absolutely must not use any other method to send this here, because they all directly or indirectly call DISCORD_ANNOUNCER and would explode.
+        #bot.do_in_loop(bot.post_message(settings.HERRING_DISCORD_DEBUG_CHANNEL, f"Discord announcer bot created in app: {settings.HEROKU_APP_NAME} / dyno {settings.HEROKU_DYNO_NAME}"))
+        return bot
+    else:
+        logging.info("Oh no, failed to create discord announcer bot :-(")
+        return None  # whoever called us will fail to say things to discover forever after :-\
+
+def do_in_discord(coro):
+    try:
+        return DISCORD_ANNOUNCER.do_in_loop(coro)
+    except RuntimeError:
+        # probably the discord bot is busted, try to make it rebuild
+        logging.error("Invalidating discord announcer bot!")
+        del DISCORD_ANNOUNCER.__target__
+        raise
+
+def do_in_discord_nonblocking(coro):
+    DISCORD_ANNOUNCER.do_in_loop_nonblocking(coro)
+
+
+def log_to_discord(message, exn=None, add_stacktrace=False):
+    try:
+        ct = threading.current_thread()
+        thread_info = [ct.name, ct.ident, ct.native_id]
+        if exn is None:
+            stack_trace = "".join(traceback.format_stack(limit=5))
+        else:
+            stack_trace = "".join(traceback.format_exception(None, exn, exn.__traceback__, limit=5))
+        if exn or add_stacktrace:
+            stack = discord.Embed(description=discord.utils.escape_markdown(stack_trace)[:MAX_DISCORD_EMBED_LEN])
+        else:
+            stack = None
+        do_in_discord_nonblocking(DISCORD_ANNOUNCER.post_message(settings.HERRING_DISCORD_DEBUG_CHANNEL, f"`log_to_discord`: `{message}` `({thread_info})`", embed=stack))
+    except Exception as e:
+        logging.error(f"Logging to Discord failed, ignoring it! message={message} exn={exn} (failed with: {e})")
 
 # Shared utilities that both bots use
 
@@ -796,7 +964,7 @@ async def _make_puzzle_channels_inner(category: discord.CategoryChannel, puzzle:
         voice_channel = get(category.guild.voice_channels, name=locked_puzzle.slug) or \
                         await category.create_voice_channel(locked_puzzle.slug, position=position, bitrate=settings.HERRING_DISCORD_BITRATE)
         return text_channel, voice_channel
-    return _manipulate_puzzle(puzzle, do_make_channels)
+    return await _manipulate_puzzle(puzzle, do_make_channels)
 
 
 def _build_topic(puzzle):
@@ -829,12 +997,15 @@ def _manipulate_puzzle(puzzle:typing.Union[Puzzle, str], func):
                 locked_puzzle = Puzzle.objects.select_for_update().get(slug=puzzle, hunt_id=settings.HERRING_HUNT_ID)
             else:
                 locked_puzzle = Puzzle.objects.select_for_update().get(id=puzzle.id)
-            func(locked_puzzle)
+            result = func(locked_puzzle)
             locked_puzzle.save()
-            return locked_puzzle
+            return result
     except Puzzle.DoesNotExist:
         return
 
+@sync_to_async
+def _get_puzzle_by_slug(slug):
+    return Puzzle.objects.get(slug=slug, hunt_id=settings.HERRING_HUNT_ID)
 
 async def _add_user_to_channels(member, text_channel:discord.TextChannel, voice_channel):
     current_perms = text_channel.overwrites
@@ -868,6 +1039,8 @@ def _update_channel_participation_inner(puzzle, membership):
 # Public factory methods
 
 async def run_listener_bot(loop):
+    logging.info("Starting Discord listener bot")
+    log_to_discord("Starting Discord listener bot")
     async with aiohttp.ClientSession(loop=loop) as client:
         bot = HerringListenerBot(loop, client)
         await bot.start(settings.HERRING_SECRETS['discord-bot-token'])
@@ -880,18 +1053,29 @@ def make_announcer_bot(token):
 
     def start_bot_thread():
         nonlocal bot
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        bot = HerringAnnouncerBot(loop=loop)
-        evt.set()
-        loop.create_task(bot.start(token))
-        loop.run_forever()
+        try:
+            logging.info("Trying to start announcer bot in thread...")
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            # Hack hack: prevent discord from emitting a warning during startup, which would wreck our day
+            discord.VoiceClient.warn_nacl = False
+            bot = HerringAnnouncerBot(loop=loop)
+            logging.info("Created announcer bot object, signalling Event.");
+            evt.set()
+            loop.create_task(bot.start(token))
+            loop.run_forever()
+        except Exception as e:
+            # This is at info because I don't want to risk problems (this code can be called from logs at WARNING and higher)
+            logging.info("Oh no, announcer bot thread exception! {e}")
 
     # make it a daemon thread so it doesn't keep the process alive
     bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
     bot_thread.start()
-    logging.info("about to wait for bot to be created")
-    evt.wait()
-    logging.info(f"got bot, it is a {type(bot)}")
-    return bot
+    result = evt.wait(timeout=5)
+    if result:
+        logging.info(f"got bot, it is a {type(bot)}")
+        return bot
+    else:
+        logging.error(f"failed to create discord announcer bot (timed out trying). Is bot thread alive: {bot_thread.is_alive()}. bot_thread: {bot_thread}")
+        return None
 
